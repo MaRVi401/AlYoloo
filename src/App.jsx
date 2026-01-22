@@ -1,135 +1,116 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import * as tf from '@tensorflow/tfjs';
-import { useYOLO } from './hooks/useYOLO';
-import { useOpenCV } from './hooks/useOpenCV';
-import { processDocument } from './utils/imageProcessing';
+import Webcam from 'react-webcam';
 import { db } from './db/database';
-import ScannerView from './components/ScannerView';
-import ControlButtons from './components/ControlButtons';
-import ScanGallery from './components/ScanGallery';
+import { processDocument, generatePDF } from './utils/imageProcessing';
 import './App.css';
 
 function App() {
-  const [facingMode, setFacingMode] = useState('environment');
-  const [refreshGallery, setRefreshGallery] = useState(0);
-  const [status, setStatus] = useState('Menginisialisasi...');
-  
+  const [model, setModel] = useState(null);
+  const [isCvReady, setIsCvReady] = useState(false);
+  const [refresh, setRefresh] = useState(0);
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
   const lastCoordsRef = useRef([]);
-  const requestRef = useRef();
 
-  const isCvReady = useOpenCV();
-  const { model, status: yoloStatus } = useYOLO('/model/model.json');
+  // Load Model & OpenCV
+  useEffect(() => {
+    const init = async () => {
+      const loadedModel = await tf.loadGraphModel('/model/model.json');
+      setModel(loadedModel);
+      if (window.cv) setIsCvReady(true);
+    };
+    init();
+  }, []);
 
-  // Logika Deteksi Real-time
   const runDetection = useCallback(async () => {
-    if (model && webcamRef.current && webcamRef.current.video.readyState === 4) {
+    if (model && webcamRef.current?.video.readyState === 4) {
       const video = webcamRef.current.video;
       const { videoWidth, videoHeight } = video;
-
       canvasRef.current.width = videoWidth;
       canvasRef.current.height = videoHeight;
 
       const tensor = tf.tidy(() => {
         const img = tf.browser.fromPixels(video);
-        return tf.image.resizeBilinear(img, [640, 640])
-          .expandDims(0)
-          .div(255.0);
+        return tf.image.resizeBilinear(img, [640, 640]).expandDims(0).div(255.0);
       });
 
-      const predictions = await model.executeAsync(tensor);
-      const data = await predictions.data();
-
-      // Ambil 4 titik keypoints (x, y) saja, abaikan confidence score
-      // YOLO pose mengembalikan [x, y, conf, x, y, conf, ...]
-      const coords = [];
-      for (let i = 0; i < 4; i++) {
-        coords.push(data[i * 3] * (videoWidth / 640));
-        coords.push(data[i * 3 + 1] * (videoHeight / 640));
+      const output = await model.executeAsync(tensor);
+      const predictions = await output.array(); // [1, 17, 8400]
+      
+      // Post-processing: Cari deteksi dengan score tertinggi
+      let maxScore = 0;
+      let bestIdx = -1;
+      const scores = predictions[0][4]; // Score box di index 4
+      for(let i=0; i<8400; i++) {
+        if(scores[i] > maxScore) {
+          maxScore = scores[i];
+          bestIdx = i;
+        }
       }
-      lastCoordsRef.current = coords;
 
-      renderCanvas(coords, videoWidth, videoHeight);
+      if (maxScore > 0.5) {
+        const coords = [];
+        // Ambil 4 keypoints (x, y) dari index 5-16
+        for (let k = 0; k < 4; k++) {
+          const x = predictions[0][5 + k * 3][bestIdx] * (videoWidth / 640);
+          const y = predictions[0][5 + k * 3 + 1][bestIdx] * (videoHeight / 640);
+          coords.push(x, y);
+        }
+        lastCoordsRef.current = coords;
+        drawOverlay(coords);
+      }
 
-      tensor.dispose();
-      predictions.dispose();
+      tf.dispose([tensor, output]);
     }
-    requestRef.current = requestAnimationFrame(runDetection);
+    requestAnimationFrame(runDetection);
   }, [model]);
 
-  const renderCanvas = (coords, width, height) => {
+  const drawOverlay = (coords) => {
     const ctx = canvasRef.current.getContext('2d');
-    ctx.clearRect(0, 0, width, height);
+    ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
     ctx.strokeStyle = "#00FF00";
-    ctx.lineWidth = 3;
+    ctx.lineWidth = 4;
     ctx.beginPath();
-    
-    for (let i = 0; i < coords.length; i += 2) {
-      const x = coords[i];
-      const y = coords[i + 1];
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
-      ctx.fillStyle = "#FF0000";
-      ctx.fillRect(x - 5, y - 5, 10, 10);
-    }
+    ctx.moveTo(coords[0], coords[1]);
+    ctx.lineTo(coords[2], coords[3]);
+    ctx.lineTo(coords[4], coords[5]);
+    ctx.lineTo(coords[6], coords[7]);
     ctx.closePath();
     ctx.stroke();
   };
 
-  useEffect(() => {
-    if (model) {
-      requestRef.current = requestAnimationFrame(runDetection);
-    }
-    return () => cancelAnimationFrame(requestRef.current);
-  }, [model, runDetection]);
-
   const handleCapture = async () => {
-    if (!model || !webcamRef.current) return;
-
-    const canvas = processDocument(
-      webcamRef.current.video,
-      lastCoordsRef.current
-    );
-
-    if (canvas) {
-      canvas.toBlob(async (blob) => {
-        await db.scans.add({ imageBlob: blob, timestamp: new Date() });
-        setRefreshGallery(prev => prev + 1);
-        alert("Dokumen berhasil disimpan!");
-      }, 'image/jpeg');
+    if (lastCoordsRef.current.length === 8) {
+      const croppedCanvas = processDocument(webcamRef.current.video, lastCoordsRef.current);
+      if (croppedCanvas) {
+        const pdfBlob = generatePDF(croppedCanvas);
+        await db.scans.add({ 
+          imageBlob: pdfBlob, 
+          timestamp: new Date(), 
+          type: 'application/pdf' 
+        });
+        alert("Berhasil! PDF tersimpan di database lokal.");
+        setRefresh(r => r + 1);
+      }
+    } else {
+      alert("Arahkan kamera sampai kotak hijau muncul!");
     }
   };
 
   return (
     <div className="container">
-      <header>
-        <h1>AI DocScanner v1.0</h1>
-        <div className={`status-badge ${model && isCvReady ? 'ready' : 'loading'}`}>
-          {yoloStatus} {isCvReady ? '| CV Ready' : '| Loading CV...'}
-        </div>
-      </header>
-
-      <main className="scanner-container">
-        <ScannerView 
+      <h1>AI DocScanner v1.0</h1>
+      <div className="webcam-wrapper">
+        <Webcam 
           ref={webcamRef} 
-          canvasRef={canvasRef} 
-          facingMode={facingMode} 
-          onLoadedMetadata={() => {}} // Sekarang dikontrol oleh useEffect
+          onLoadedMetadata={runDetection} 
+          videoConstraints={{ facingMode: 'environment' }} 
         />
-        
-        <ControlButtons 
-          onCapture={handleCapture} 
-          onSwitchCamera={() => setFacingMode(m => m === 'user' ? 'environment' : 'user')} 
-          isLoading={!model}
-        />
-
-        <ScanGallery refreshTick={refreshGallery} />
-      </main>
-
-      <footer className="footer-info">
-        <p>Ahmad Yassin | Teknik Informatika Polindra</p>
-      </footer>
+        <canvas ref={canvasRef} className="overlay-canvas" />
+      </div>
+      <button className="primary-btn" onClick={handleCapture}>📸 Ambil & Simpan PDF</button>
+      <p>Status: {model && isCvReady ? "Sistem Siap" : "Memuat..."}</p>
     </div>
   );
 }
