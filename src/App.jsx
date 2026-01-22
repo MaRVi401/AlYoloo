@@ -1,50 +1,29 @@
-import { useState, useEffect, useRef } from 'react'
-import * as tf from '@tensorflow/tfjs'
-import Webcam from 'react-webcam'
-import './App.css'
+import { useState, useRef, useEffect, useCallback } from 'react';
+import * as tf from '@tensorflow/tfjs';
+import { useYOLO } from './hooks/useYOLO';
+import { useOpenCV } from './hooks/useOpenCV';
+import { processDocument } from './utils/imageProcessing';
+import { db } from './db/database';
+import ScannerView from './components/ScannerView';
+import ControlButtons from './components/ControlButtons';
+import ScanGallery from './components/ScanGallery';
+import './App.css';
 
 function App() {
-  const [model, setModel] = useState(null);
-  const [isCvReady, setIsCvReady] = useState(false);
-  const [status, setStatus] = useState('Menyiapkan sistem...');
-  const [facingMode, setFacingMode] = useState('environment'); 
+  const [facingMode, setFacingMode] = useState('environment');
+  const [refreshGallery, setRefreshGallery] = useState(0);
+  const [status, setStatus] = useState('Menginisialisasi...');
+  
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
+  const lastCoordsRef = useRef([]);
+  const requestRef = useRef();
 
-  useEffect(() => {
-    // 1. Inisialisasi OpenCV.js
-    const initCV = () => {
-      if (window.cv) {
-        setIsCvReady(true);
-        console.log('OpenCV.js Ready');
-      }
-    };
+  const isCvReady = useOpenCV();
+  const { model, status: yoloStatus } = useYOLO('/model/model.json');
 
-    // 2. Memuat Model YOLO (TF.js)
-    const loadModel = async () => {
-      try {
-        setStatus('Memuat Model AI...');
-        // Model dimuat dari folder public/model/
-        const loadedModel = await tf.loadGraphModel('/model/model.json');
-        setModel(loadedModel);
-        setStatus('Sistem Siap Digunakan');
-        console.log('YOLO Model Loaded');
-      } catch (error) {
-        console.error('Gagal memuat model:', error);
-        setStatus('Error: Model AI tidak ditemukan');
-      }
-    };
-
-    initCV();
-    loadModel();
-  }, []);
-
-  const switchCamera = () => {
-    setFacingMode((prevMode) => (prevMode === 'user' ? 'environment' : 'user'));
-  };
-
-  // --- LOGIKA UTAMA DETEKSI ---
-  const runDetection = async () => {
+  // Logika Deteksi Real-time
+  const runDetection = useCallback(async () => {
     if (model && webcamRef.current && webcamRef.current.video.readyState === 4) {
       const video = webcamRef.current.video;
       const { videoWidth, videoHeight } = video;
@@ -52,7 +31,6 @@ function App() {
       canvasRef.current.width = videoWidth;
       canvasRef.current.height = videoHeight;
 
-      // Pre-processing Tensor
       const tensor = tf.tidy(() => {
         const img = tf.browser.fromPixels(video);
         return tf.image.resizeBilinear(img, [640, 640])
@@ -60,92 +38,100 @@ function App() {
           .div(255.0);
       });
 
-      // Prediksi (Inference speed ~3.5ms)
       const predictions = await model.executeAsync(tensor);
-      
-      // Render hasil ke Canvas
-      renderKeypoints(predictions, videoWidth, videoHeight);
+      const data = await predictions.data();
 
-      // Pembersihan Memori
+      // Ambil 4 titik keypoints (x, y) saja, abaikan confidence score
+      // YOLO pose mengembalikan [x, y, conf, x, y, conf, ...]
+      const coords = [];
+      for (let i = 0; i < 4; i++) {
+        coords.push(data[i * 3] * (videoWidth / 640));
+        coords.push(data[i * 3 + 1] * (videoHeight / 640));
+      }
+      lastCoordsRef.current = coords;
+
+      renderCanvas(coords, videoWidth, videoHeight);
+
       tensor.dispose();
       predictions.dispose();
-
-      // Loop deteksi secara real-time
-      requestAnimationFrame(runDetection);
     }
-  };
+    requestRef.current = requestAnimationFrame(runDetection);
+  }, [model]);
 
-  const renderKeypoints = (output, width, height) => {
+  const renderCanvas = (coords, width, height) => {
     const ctx = canvasRef.current.getContext('2d');
     ctx.clearRect(0, 0, width, height);
-
-    const data = output.dataSync(); // Mengambil data koordinat
-    // Logika YOLO Pose: Biasanya 4 titik sudut (Keypoints)
-    // Titik sudut: Kiri Atas, Kanan Atas, Kanan Bawah, Kiri Bawah
-    
     ctx.strokeStyle = "#00FF00";
     ctx.lineWidth = 3;
     ctx.beginPath();
-
-    // Mapping koordinat dari 640x640 ke ukuran Video Asli
-    for (let i = 0; i < 4; i++) {
-      const x = data[i * 3] * (width / 640);
-      const y = data[i * 3 + 1] * (height / 640);
-      
+    
+    for (let i = 0; i < coords.length; i += 2) {
+      const x = coords[i];
+      const y = coords[i + 1];
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
-
-      // Gambar bulatan di setiap sudut
       ctx.fillStyle = "#FF0000";
       ctx.fillRect(x - 5, y - 5, 10, 10);
     }
-    
     ctx.closePath();
     ctx.stroke();
+  };
+
+  useEffect(() => {
+    if (model) {
+      requestRef.current = requestAnimationFrame(runDetection);
+    }
+    return () => cancelAnimationFrame(requestRef.current);
+  }, [model, runDetection]);
+
+  const handleCapture = async () => {
+    if (!model || !webcamRef.current) return;
+
+    const canvas = processDocument(
+      webcamRef.current.video,
+      lastCoordsRef.current
+    );
+
+    if (canvas) {
+      canvas.toBlob(async (blob) => {
+        await db.scans.add({ imageBlob: blob, timestamp: new Date() });
+        setRefreshGallery(prev => prev + 1);
+        alert("Dokumen berhasil disimpan!");
+      }, 'image/jpeg');
+    }
   };
 
   return (
     <div className="container">
       <header>
         <h1>AI DocScanner v1.0</h1>
-        <div className={`status-badge ${model ? 'ready' : 'loading'}`}>
-          {status}
+        <div className={`status-badge ${model && isCvReady ? 'ready' : 'loading'}`}>
+          {yoloStatus} {isCvReady ? '| CV Ready' : '| Loading CV...'}
         </div>
       </header>
 
       <main className="scanner-container">
-        <div className="webcam-wrapper">
-          <Webcam
-            ref={webcamRef}
-            audio={false}
-            screenshotFormat="image/jpeg"
-            videoConstraints={{ facingMode }}
-            className="webcam-view"
-            onLoadedMetadata={runDetection} // Mulai deteksi saat kamera siap
-          />
-          <canvas ref={canvasRef} className="overlay-canvas" />
-        </div>
+        <ScannerView 
+          ref={webcamRef} 
+          canvasRef={canvasRef} 
+          facingMode={facingMode} 
+          onLoadedMetadata={() => {}} // Sekarang dikontrol oleh useEffect
+        />
+        
+        <ControlButtons 
+          onCapture={handleCapture} 
+          onSwitchCamera={() => setFacingMode(m => m === 'user' ? 'environment' : 'user')} 
+          isLoading={!model}
+        />
 
-        <div className="button-group">
-          <button className="secondary-btn" onClick={switchCamera}>
-            🔄 Ganti Kamera
-          </button>
-          <button 
-            className="primary-btn" 
-            disabled={!model}
-            onClick={() => alert("Dokumen Berhasil Dipindai!")}
-          >
-            📸 Ambil Gambar
-          </button>
-        </div>
+        <ScanGallery refreshTick={refreshGallery} />
       </main>
 
-      <section className="footer-info">
+      <footer className="footer-info">
         <p>Ahmad Yassin | Teknik Informatika Polindra</p>
-        <p>Model mAP: 98.8% | Local Persistence Mode</p>
-      </section>
+      </footer>
     </div>
-  )
+  );
 }
 
 export default App;
